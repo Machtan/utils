@@ -1,0 +1,26 @@
+# Currently this should be named "fargo.toml" for the build script to use it
+# This is an example of a real script I've used to compile mac stuff for the
+# Fcar project hosted at machtan/fcar
+name = "FCar"
+main = "Program.fs"
+assets = "assets"
+developer = "com.machtan"
+version = "1.0.0"
+icon = "icon.icns"
+authors = ["Jakob Lautrup Nysom",]
+
+dependencies = [
+    "MonoMac",
+    "Lidgren.Network",
+    "Tao.Sdl",
+    "MonoGame.Framework"
+]
+
+# The order of these is important!
+# (Maybe I'll add a dependency graph at some point)
+modules = [ 
+    "TestPlatformerActor",
+    "TestPlatformerPhysics", #requires actor
+    "TestPlatformerInput", #requires actor
+    "TestPlatformerGame", #requires all three
+]
