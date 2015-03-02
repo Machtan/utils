@@ -5,6 +5,8 @@ import os
 import argparse
 import shutil
 
+from depres import resolve_build_order
+
 """
 An F# MonoGame build utility
 Very tightly coupled atm.
@@ -23,6 +25,23 @@ class SpecException(Exception):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+def get_build_command(graph, target, prefix="", includes=[], library=True, 
+        extra_flags=[]):
+    """Creates the fsharp build command for the given item"""
+    cmd = ["fsharpc", "--nologo", target + ".fs"]
+    suffix = ".exe"
+    if library:
+        cmd.append("-a")
+        suffix = ".dll"
+    for inc in includes:
+        cmd.append("-I:{}".format(inc))
+    for dep in graph[target][1]:
+        cmd.append("-r:{}.dll".format(dep))
+    if prefix:
+        cmd.append("-o:{}{}".format(os.path.join(prefix, target), suffix))
+    cmd.extend(extra_flags)
+    return cmd
+
 def load_spec():
     """Attempts to load the local build specification"""
     if not os.path.exists(CONFIG):
@@ -40,11 +59,11 @@ def load_spec():
         ensure_not_missing("name")
         ensure_not_missing("main")
         ensure_not_missing("assets")
-        ensure_not_missing("dependencies")
-        ensure_not_missing("modules")
+        ensure_not_missing("targets")
         ensure_not_missing("developer")
         ensure_not_missing("authors")
         ensure_not_missing("version")
+        ensure_not_missing("libraries")
         ensure_not_missing("icon")
         if missing:
             print("The following fields were missing!")
@@ -87,18 +106,20 @@ def bundle(clean=False, release=False):
     specs = load_spec()
     AUTHORS = specs['authors']
     NAME = specs['name']
-    DEPS = specs['dependencies']
-    MODS = specs['modules']
+    MAIN = specs['main']
+    LIBS = specs['libraries']
+    TARGETS = specs['targets']
     DEV = specs['developer']
     ASSETS = specs['assets']
     VERSION = specs['version']
-    APP_NAME = NAME+".app"
-    EXE_NAME = NAME+".exe"
+    APP_NAME = NAME + ".app"
+    EXE_NAME = MAIN + ".exe"
     APP_DIR = pj(BUILD_DIR, APP_NAME)
     ICON_NAME = specs['icon']
 
     if not os.path.exists(os.path.join(BUILD_DIR, EXE_NAME)):
-        return print("Executable not found, cannot bundle.")
+        print("Executable not found, cannot bundle.")
+        return 1
 
     # Begin!
     print("> Bundling app...")
@@ -146,22 +167,24 @@ def bundle(clean=False, release=False):
         if file.endswith(".exe"):
             os.remove(pj(BUNDLE_DIR, file))
 
-    exe_path = pj(BUNDLE_DIR, EXE_NAME)
+    exe_dst = pj(BUNDLE_DIR, NAME + ".exe")
     exe_src = pj(BUILD_DIR, EXE_NAME)
-    remove_if_clean(exe_path)
-    shutil.copy(exe_src, exe_path)
+    remove_if_clean(exe_dst)
+    shutil.copy(exe_src, exe_dst)
 
     # Copy all dlls if this is not a release build
     if not release:
         print("> Copying binaries/assemblies...")
-        for dep in DEPS:
+        for dep in LIBS:
             fullname = dep + ".dll"
             dep_src = pj(BINARIES_DIR, fullname)
             dep_dst = pj(BUNDLE_DIR, fullname)
             replace_if_newer(dep_src, dep_dst)
 
-        for mod in MODS:
-            fullname = mod + ".dll"
+        for target in TARGETS:
+            if target == MAIN:
+                continue
+            fullname = target + ".dll"
             mod_src = pj(BUILD_DIR, fullname)
             mod_dst = pj(BUNDLE_DIR, fullname)
             replace_if_newer(mod_src, mod_dst)
@@ -197,60 +220,66 @@ def build(platform="mac", release=False):
     """Builds the F# program from the given specification dictionary"""
     specs = load_spec()
     ensure_build()
-
-    cmd = []
-    cmd.append(BUILD_CMD)
-    cmd.append("--nologo")
-
-    cmd.append("-I:{}".format(BINARIES_DIR))
-    cmd.append("-I:{}".format(BUILD_DIR))
-
+    
+    TARGETS = specs['targets']
+    LIBS = specs["libraries"]
+    MAIN = specs["main"]
+    
+    INCLUDES = [BINARIES_DIR, BUILD_DIR]
+    EXTRA_FLAGS = [] 
     if platform == "mac":
-        cmd.append("-d:TARGET_MAC")
-
-    for dep in specs['dependencies']:
-        cmd.append("-r:{}.dll".format(dep))
-
-    # Build the submodules in the right order
-    mods = specs['modules']
-    submodules = []
-    recompile = False
-    for mod in mods:
-        script = mod + ".fs"
-        mod_name = mod + ".dll"
-        mod_dst = os.path.join(BUILD_DIR, mod_name)
-        if recompile or newer(script, mod_dst):
-            print("> Building '{}'...".format(script))
-            recompile = True #  Make sure to also recompile the dependent scripts
-
-            # Compile the module
-            mod_cmd = cmd + [script, "-a", "-o:{}".format(mod_dst)] + submodules
-            print("$ {}".format(" ".join(mod_cmd)))
-            exit_status = subprocess.call(mod_cmd)
+        EXTRA_FLAGS.append("-d:TARGET_MAC")
+    if release:
+        EXTRA_FLAGS.append("-O")
+    PREFIX = BUILD_DIR
+    
+    # Resolve dependencies
+    # - Populate the graph
+    graph = {}
+    for library in LIBS:
+        graph[library] = (False, [])
+        
+    for target, deps in TARGETS.items():
+        suffix = ".exe" if target == MAIN else ".dll"
+        src = target + ".fs"
+        dst = os.path.join(BUILD_DIR, target + suffix)
+        updated = newer(src, dst)
+        graph[target] = (updated, deps)
+    
+    # Get the build order
+    order = resolve_build_order(graph, MAIN)
+    
+    # Exit early if the build is not needed
+    needs_rebuild = False
+    for t, n in order:
+        if n:
+            needs_rebuild = True
+            break
+    if not needs_rebuild:
+        return 0
+    
+    #print("Order:")
+    #print(order)
+    
+    for target, needs_build in order:
+        if needs_build:
+            extra = EXTRA_FLAGS
+            if target == MAIN:
+                lib = False
+                if release:
+                    extra.append("--standalone")
+            else:
+                lib = True
+            print("> Building '{}'...".format(target))
+            cmd = get_build_command(graph, target, prefix=PREFIX, 
+                includes=INCLUDES, library=lib, extra_flags=extra)
+            print("$ {}".format(" ".join(cmd)))
+            exit_status = subprocess.call(cmd)
             if exit_status: #  Interrupt on fail
-                print("> Failed to build submodule '{}'".format(mod_name))
+                print("> Failed to build '{}'".format(target))
                 return exit_status
         else:
-            print("> '{}' was built, skipping...".format(mod_name))
-
-        submodules.append("-r:{}".format(mod_name))
-
-    # Build the main program
-    if release:
-        cmd.append("--standalone")
-
-    out_file_name = specs['name'] + EXTENSION
-    out_file = os.path.join(BUILD_DIR, out_file_name)
-    cmd.append("-o:{}".format(out_file))
-
-    main_file = specs['main']
-    cmd.append(main_file)
-    cmd.extend(submodules)
-
-    print("$ {}".format(" ".join(cmd)))
-    built = subprocess.call(cmd)
-    if built: # Exit on failure
-        return built
+            print("> '{}' was built, skipping...".format(target))
 
     # Bundle the program if on mac
     if platform == "mac":
@@ -266,23 +295,8 @@ def run(force_recompile=False, args=[]):
     target = os.path.join(BUILD_DIR, NAME + EXTENSION)
     main_file = specs['main']
 
-    # Compiled version exists
-    new_build = force_recompile
-    if os.path.exists(target):
-        # Check if it needs to be recompiled
-        checks = [main_file] + [m + ".fs" for m in specs["modules"]]
-        for check in checks:
-            if (os.stat(target).st_ctime < os.stat(check).st_ctime):
-                print("> New build!")
-                new_build = True
-                break
-    else:
-        new_build = True
-
-    if new_build:
-        print("> Recompiling...")
-        if build(): # Return not 0 => error
-            return print("Error while building! Run failed.")
+    if build(): # Return not 0 => error
+        return print("Error while building! Run failed.")
 
     RUN_PATH = os.path.join(BUILD_DIR, NAME+".app", "Contents", BIN_DIR, NAME)
     cmd = [RUN_PATH] + args
